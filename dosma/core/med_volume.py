@@ -20,6 +20,8 @@ from dosma.core.io.format_io import ImageDataFormat
 from dosma.defaults import SCANNER_ORIGIN_DECIMAL_PRECISION
 from dosma.utils import env
 
+from scipy.ndimage import map_coordinates
+
 if env.sitk_available():
     import SimpleITK as sitk
 if env.cupy_available():
@@ -133,11 +135,18 @@ class MedicalVolume(NDArrayOperatorsMixin):
         headers (array-like[pydicom.FileDataset]): Headers for DICOM files.
     """
 
-    def __init__(self, volume, affine, headers=None):
+    def __init__(self, volume, affine, headers=None, real_slice_thickness=None):
         xp = get_array_module(volume)
         self._volume = xp.asarray(volume)
         self._affine = np.array(affine)
         self._headers = self._validate_and_format_headers(headers) if headers is not None else None
+        if real_slice_thickness is None:
+            if self._headers is not None:
+                # get slice thickness from headers
+                real_slice_thickness = self._headers[0,0,0].get('SliceThickness', self.pixel_spacing[2])
+            else:
+                real_slice_thickness = self.pixel_spacing[2]
+        self._real_slice_thickness = real_slice_thickness
 
     def save_volume(self, file_path: str, data_format: ImageDataFormat = ImageDataFormat.nifti):
         """Write volumes in specified data format.
@@ -247,9 +256,10 @@ class MedicalVolume(NDArrayOperatorsMixin):
             self._affine = temp_affine
             self._volume = volume
             self._headers = headers
+            self._real_slice_thickness = self.pixel_spacing[2]
             mv = self
         else:
-            mv = self._partial_clone(volume=volume, affine=temp_affine, headers=headers)
+            mv = self._partial_clone(volume=volume, affine=temp_affine, headers=headers, real_slice_thickness=np.abs(temp_affine[2,2]))
 
         assert (
             mv.orientation == new_orientation
@@ -268,6 +278,68 @@ class MedicalVolume(NDArrayOperatorsMixin):
             MedicalVolume: The reformatted volume. If ``inplace=True``, returns ``self``.
         """
         return self.reformat(other.orientation, inplace=inplace)
+    
+    def realign_to(self, other, inplace: bool = False, interpolation_order: int = 3) -> "MedicalVolume":
+        """Realign this volume to the image space of another volume. Similar to ``reformat_as``,
+        except that it supports fine rotations, translations and shape changes, so that the affine
+        matrix and extent of the modified volume is identical to the one of the target.
+        
+
+        Args:
+            other (MedicalVolume): The realigned volume will have the same extent and affine matrix of ``other``.
+            inplace (bool, optional): If `True`, do operation in-place and return ``self``.
+            interpolation_order (int, optional): spline interpolation order.
+
+        Returns:
+            MedicalVolume: The realigned volume. If ``inplace=True``, returns ``self``.
+        """
+        target = other.volume
+        
+        other_thickness = other.real_slice_thickness
+        # disregard our own slice thickness for the moment
+        # calculate the difference from the center of each 3D "partition" and the real center of the 2D slice
+        z_offset = 0 
+        
+        # The following would be need to be used if the origin of the affine matrix was calculated on the middle of the
+        # slice with thickness == slice spacing. But centering the converted dataset on the real center of the slice
+        # seems to be the norm, hence the z_offset is 0
+        # z_offset = (other_thickness/other.pixel_spacing[2]/2 - 1/2) #(other_thickness - other.pixel_spacing[2])/2
+        
+        shape_as_range = (np.arange(target.shape[0]),
+                          np.arange(target.shape[1]),
+                          np.arange(target.shape[2]) + z_offset)
+            
+        coords = np.array(np.meshgrid(*shape_as_range, indexing='ij')).astype(float)
+        
+        # Add additional dimension with 1 to each coordinate to make work with 4x4 affine matrix
+        addon = np.ones([1, coords.shape[1], coords.shape[2], coords.shape[3]])
+        coords = np.concatenate([coords, addon], axis=0)  # shape: [4, x, y, z]
+        coords = coords.reshape([4, -1])  # shape: [4, x*y*z]
+    
+        # build affine which maps from target grid to source grid
+        aff_transf = np.linalg.inv(self._affine) @ other.affine
+        
+        # transform the coords from target grid to the space of source image
+        coords_src = aff_transf @ coords  # shape: [4, x*y*z]
+    
+        # reshape to original spatial dimensions
+        coords_src = coords_src.reshape((4,) + target.shape)[:3,...]  # shape: [3, x, y, z]
+    
+        # Will create a image with the spatial size of coords_src (with is target.shape). Each
+        # coordinate contains a place in the source image from which the intensity is taken 
+        # and filled into the new image. If the coordinate is not within the range of the source image then
+        # will be filled with 0.
+        src_transf_data = map_coordinates(self._volume, coords_src, order=interpolation_order)
+        if inplace:
+            self._affine = other.affine
+            self._volume = src_transf_data
+            self._headers = other.headers
+            self._real_slice_thickness = other.real_slice_thickness
+            mv = self
+        else:
+            mv = self._partial_clone(volume=src_transf_data, affine=other.affine, headers=other.headers, real_slice_thickness=other.real_slice_thickness)
+        
+        return mv
 
     def is_identical(self, mv):
         """Check if another medical volume is identical.
@@ -830,6 +902,14 @@ class MedicalVolume(NDArrayOperatorsMixin):
         return stdo.orientation_nib_to_standard(nib_orientation)
 
     @property
+    def real_slice_thickness(self):
+        """float: Real slice thickness"""
+        if self._real_slice_thickness is None:
+            return self.pixel_spacing[2]
+        else:
+            return self._real_slice_thickness
+
+    @property
     def scanner_origin(self):
         """tuple[float]: Scanner origin in global RAS+ x,y,z coordinates."""
         return tuple(self._affine[:3, 3])
@@ -1065,6 +1145,8 @@ class MedicalVolume(NDArrayOperatorsMixin):
             kwargs["headers"] = self._headers
         elif isinstance(kwargs["headers"], bool) and kwargs["headers"]:
             kwargs["headers"] = deepcopy(self._headers)
+        if "real_slice_thickness" not in kwargs:
+            kwargs["real_slice_thickness"] = self._real_slice_thickness
         return self.__class__(**kwargs)
 
     def _validate_and_format_headers(self, headers):

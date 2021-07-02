@@ -512,7 +512,11 @@ def to_RAS_affine(headers: List[pydicom.FileDataset], default_ornt: Tuple[str, s
             headers[0].ImagePositionPatient
         ).astype(np.float64)
     else:
-        slice_thickness = headers[0].get("SliceThickness", 1.0)
+        if hasattr(headers[0], "SpacingBetweenSlices"):
+            slice_thickness = abs(headers[0].SpacingBetweenSlices)
+        else:
+            slice_thickness = headers[0].get("SliceThickness", 1.0)
+            
         i_norm = 1 / np.linalg.norm(i_vec) * i_vec
         j_norm = 1 / np.linalg.norm(j_vec) * j_vec
         k_norm = np.cross(i_norm, j_norm)
